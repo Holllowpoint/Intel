@@ -1,39 +1,12 @@
 import os
-import sqlite3
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 from datetime import datetime, timezone, timedelta
 import traceback
 import csv
-import hashlib
-import base64
-import secrets
 import threading
 import re
-
-# Password hashing utilities
-def _hash_password(password: str) -> str:
-    """Hash a password with a random salt using PBKDF2."""
-    salt = secrets.token_bytes(32)
-    hash_bytes = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
-    salt_b64 = base64.b64encode(salt).decode('ascii')
-    hash_b64 = base64.b64encode(hash_bytes).decode('ascii')
-    return f"{salt_b64}${hash_b64}"
-
-def _verify_password(password: str, stored: str) -> bool:
-    """Verify a password against a stored hash."""
-    try:
-        salt_b64, hash_b64 = stored.split('$', 1)
-        salt = base64.b64decode(salt_b64)
-        hash_bytes = base64.b64decode(hash_b64)
-        test_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
-        return secrets.compare_digest(hash_bytes, test_hash)
-    except Exception:
-        return False
-
-def _is_hashed_password(password: str) -> bool:
-    """Check if a password is already hashed (contains $ separator)."""
-    return '$' in password and len(password.split('$')) == 2
+from database import SyllabusDB
 
 class ProgressSpinner:
     """Animated progress spinner for AI operations."""
@@ -321,161 +294,6 @@ def _format_date_time_local(date_iso: str, time_hm: str | None):
         return f"{date_iso} {time_hm or ''}".strip()
 
 
-class SyllabusDB:
-    # Whitelist of allowed columns for update operations
-    ALLOWED_COLUMNS = {
-        "details", "date", "time", "status", "started_at", 
-        "completed_at", "submission", "type", "subject"
-    }
-    
-    def __init__(self, path=None):
-        if path is None:
-            base = os.path.dirname(os.path.abspath(__file__))
-            path = os.path.join(base, "syllabus.db")
-        self.path = path
-        self.conn = sqlite3.connect(self.path, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
-        self.conn.row_factory = sqlite3.Row
-        self._migrate_table()
-
-    def _migrate_table(self):
-        cur = self.conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS syllabus_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                details TEXT NOT NULL,
-                date TEXT,
-                time TEXT,
-                created_at TEXT,
-                status TEXT DEFAULT 'pending',
-                started_at TEXT,
-                completed_at TEXT,
-                type TEXT DEFAULT 'topic',
-                subject TEXT,
-                submission TEXT
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                email TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                role TEXT NOT NULL
-            )
-            """
-        )
-        self.conn.commit()
-
-        # Add new columns if missing
-        cur.execute("PRAGMA table_info(syllabus_items)")
-        cols = {r["name"] for r in cur.fetchall()}
-        add = []
-        if "type" not in cols:
-            add.append("ALTER TABLE syllabus_items ADD COLUMN type TEXT DEFAULT 'topic'")
-        if "subject" not in cols:
-            add.append("ALTER TABLE syllabus_items ADD COLUMN subject TEXT")
-        if "submission" not in cols:
-            add.append("ALTER TABLE syllabus_items ADD COLUMN submission TEXT")
-        for stmt in add:
-            try:
-                cur.execute(stmt)
-            except Exception:
-                pass
-        
-        # Migrate existing plaintext passwords to hashed passwords
-        try:
-            cur.execute("SELECT id, email, password FROM users WHERE password NOT LIKE '%$%'")
-            plaintext_users = cur.fetchall()
-            for user in plaintext_users:
-                hashed_password = _hash_password(user["password"])
-                cur.execute("UPDATE users SET password = ? WHERE id = ?", (hashed_password, user["id"]))
-        except Exception:
-            pass  # Ignore migration errors
-        
-        self.conn.commit()
-
-    def add_user(self, email, password, role):
-        cur = self.conn.cursor()
-        hashed_password = _hash_password(password)
-        cur.execute("INSERT OR IGNORE INTO users (email, password, role) VALUES (?, ?, ?)", (email, hashed_password, role))
-        self.conn.commit()
-
-    def get_user(self, email, password):
-        cur = self.conn.cursor()
-        cur.execute("SELECT password, role FROM users WHERE email = ?", (email,))
-        row = cur.fetchone()
-        if row:
-            stored_password = row["password"]
-            
-            # Check if password is already hashed (contains $ separator)
-            if _is_hashed_password(stored_password):
-                # Verify hashed password
-                if _verify_password(password, stored_password):
-                    return row["role"]
-            else:
-                # Legacy plaintext password - verify directly and migrate
-                if password == stored_password:
-                    # Migrate to hashed password
-                    hashed_password = _hash_password(password)
-                    cur.execute("UPDATE users SET password = ? WHERE email = ?", (hashed_password, email))
-                    self.conn.commit()
-                    return row["role"]
-        
-        return None
-
-    def add_item(self, details, date_iso, time_hm, item_type, subject):
-        created = datetime.utcnow().isoformat() + "Z"
-        cur = self.conn.cursor()
-        cur.execute(
-            "INSERT INTO syllabus_items (details, date, time, created_at, status, type, subject) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (details, date_iso, time_hm, created, "pending", item_type, subject),
-        )
-        self.conn.commit()
-        return cur.lastrowid
-
-    def list_items(self):
-        cur = self.conn.cursor()
-        cur.execute("SELECT * FROM syllabus_items")
-        return cur.fetchall()
-
-    def get_item(self, item_id):
-        cur = self.conn.cursor()
-        cur.execute("SELECT * FROM syllabus_items WHERE id = ?", (item_id,))
-        return cur.fetchone()
-
-    def delete_item(self, item_id):
-        cur = self.conn.cursor()
-        cur.execute("DELETE FROM syllabus_items WHERE id = ?", (item_id,))
-        self.conn.commit()
-
-    def update_item(self, item_id, **fields):
-        if not fields:
-            return
-        
-        # Validate column names against whitelist
-        invalid_columns = set(fields.keys()) - self.ALLOWED_COLUMNS
-        if invalid_columns:
-            raise ValueError(f"Invalid column names: {', '.join(invalid_columns)}. Allowed: {', '.join(sorted(self.ALLOWED_COLUMNS))}")
-        
-        keys = ", ".join(f"{k} = ?" for k in fields.keys())
-        vals = list(fields.values()) + [item_id]
-        cur = self.conn.cursor()
-        cur.execute(f"UPDATE syllabus_items SET {keys} WHERE id = ?", vals)
-        self.conn.commit()
-
-    def close(self):
-        try:
-            self.conn.commit()
-        except Exception:
-            pass
-        try:
-            self.conn.close()
-        except Exception:
-            pass
-
-
 class EducationApp:
     def __init__(self, root):
         self.root = root
@@ -703,7 +521,8 @@ class EducationApp:
                     # Schedule UI update on main thread
                     self.root.after(0, lambda: self._handle_ai_response(response, spinner))
                 except Exception as ex:
-                    self.root.after(0, lambda: self._handle_ai_error(str(ex), spinner))
+                    error_message = str(ex)
+                    self.root.after(0, lambda: self._handle_ai_error(error_message, spinner))
             
             # Start AI query in background thread
             thread = threading.Thread(target=ai_worker, daemon=True)
@@ -795,7 +614,11 @@ class EducationApp:
 
                 desc_widget = tk.Text(frame, height=4, wrap=tk.WORD)
                 desc_widget.insert("1.0", f"{item['subject']} - {item['type'].capitalize()}: {item['details']}")
-                desc_widget.configure(state="disabled", background=frame.cget("background"), relief=tk.FLAT)
+                desc_widget.configure(
+                    state="disabled",
+                    background=self.style.lookup("TFrame", "background"),
+                    relief=tk.FLAT,
+                )
                 desc_widget.grid(row=0, column=0, sticky="we")
 
                 def make_view_full(trow):
@@ -910,7 +733,8 @@ class EducationApp:
                                     # Schedule UI update on main thread
                                     self.root.after(0, lambda: self._handle_ask_ai_response(response, spinner))
                                 except Exception as ex:
-                                    self.root.after(0, lambda: self._handle_ask_ai_error(str(ex), spinner))
+                                    error_message = str(ex)
+                                    self.root.after(0, lambda: self._handle_ask_ai_error(error_message, spinner))
                             
                             # Start AI query in background thread
                             thread = threading.Thread(target=ai_worker, daemon=True)
@@ -996,7 +820,8 @@ class EducationApp:
                         # Schedule UI update on main thread
                         self.root.after(0, lambda: self._handle_companion_response(response, query_btn))
                     except Exception as ex:
-                        self.root.after(0, lambda: self._handle_companion_error(str(ex), query_btn))
+                        error_message = str(ex)
+                        self.root.after(0, lambda: self._handle_companion_error(error_message, query_btn))
                 
                 # Start AI query in background thread
                 thread = threading.Thread(target=ai_worker, daemon=True)
