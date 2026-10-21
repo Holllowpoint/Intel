@@ -1,12 +1,12 @@
 import requests
 import json
 import time
-import base64
+import os
 from typing import Dict, Any, Callable
 
 # --- CONFIGURATION & API KEY ---
 # The API Key provided by the user is integrated here.
-GEMINI_API_KEY = "***REMOVED***"
+GEMINI_API_KEY = ""
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent"
 MAX_RETRIES = 5
 
@@ -29,8 +29,8 @@ SCHEMA = {
 
 # Define the system instruction to guide the AI's persona and task.
 SYSTEM_INSTRUCTION = (
-    "You are the 'Intelligent Study Companion AI'. Your task is to analyze the user's syllabus "
-    "data and their specific question, then provide a structured, actionable analysis and "
+    "You are the 'Intelligent Study Companion AI'. Your task is to search and analyze the user's syllabus,"
+    " pastpapers, studyguides and necessary or relevant materials data and their specific question, then provide a structured, actionable analysis and "
     "set of recommendations. You must strictly adhere to the provided JSON schema and "
     "provide only the JSON object in your response."
 )
@@ -40,7 +40,7 @@ class GeminiCompanion:
     Handles structured communication with the Gemini API.
     """
     def __init__(self, api_key: str = GEMINI_API_KEY):
-        self.api_key = api_key
+        self.api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
 
     def _call_api(self, user_prompt: str) -> Dict[str, Any] | None:
         """Handles the API POST request with exponential backoff."""
